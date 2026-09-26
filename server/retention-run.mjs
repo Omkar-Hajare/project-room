@@ -80,7 +80,7 @@ export { RetentionRunError };
 // deleting any row whose age cannot be proven from its integer timestamp.
 export function runLiveStoreRetention({ store, env, now, limit = RETENTION_BATCH_LIMIT, record } = {}) {
   const db = store?.db;
-  if (!db || typeof db.prepare !== "function") fail("A live store with a SQLite handle is required");
+  if (!db || typeof db.prepare !== "function" || typeof store.transaction !== "function") fail("A live store with a transaction adapter is required");
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > RETENTION_BATCH_LIMIT) fail("Invalid retention batch limit");
   const clock = now === undefined ? Date.now() : Date.parse(now);
   if (!Number.isSafeInteger(clock) || clock < 0) fail("Invalid retention clock");
@@ -89,8 +89,7 @@ export function runLiveStoreRetention({ store, env, now, limit = RETENTION_BATCH
   let deleted = 0;
   // Serialize the scan and writes. A failed category rolls back the whole
   // batch rather than leaving an unreported partial purge.
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  return store.transaction(() => {
     for (const [table, days] of Object.entries(DISPOSABLE_LOG_DAYS)) {
       const cutoff = clock - days * 86400000;
       // Identifiers come only from this closed, hardcoded table list.
@@ -108,7 +107,6 @@ export function runLiveStoreRetention({ store, env, now, limit = RETENTION_BATCH
       excluded: Object.freeze(["events", "commands", "account_access_events", "membership_invitation_events"]),
       categories: Object.freeze(details) });
     if (typeof record === "function") record(receipt);
-    db.exec("COMMIT");
     return receipt;
-  } catch (error) { db.exec("ROLLBACK"); throw error; }
+  });
 }
