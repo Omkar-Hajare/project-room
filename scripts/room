@@ -200,11 +200,24 @@ Agent verbs (post as comments on the board, prefixed [<lane>] + protocol prefix)
             --live rebuilds from the board instead. --work-for answers
             "is there work for me?": submitted-but-unclaimed tasks, leases
             expiring <6h, unclaimed lanes.
+  overlaps  [--files "a,b"] [--state PATH] [--live]
+            Read-only file-claim registry check. With --files, reports which
+            live claims already hold those files (pre-claim collision check).
+            Without --files, reports every file held by 2+ live claims.
   handoff   --task-id ID --from LANE --to LANE --context "..." [--note "..."] [--dry-run]
             Post [lane]HANDOFF: with room-handoff block + restated claim block
             naming the receiving lane. (Transfers on ACK, not on post.)
   receipt   --task-id ID --lane LANE --merged SHA|none --note "..." [--dry-run]
             Post [lane]DONE: + room-receipt block (24h receipt SLO).
+  backlog   [list] [--file PATH]
+            List BACKLOG.md ready items, top first.
+  backlog   pull [--lane LANE] [--task-id ID] [--lease Nh] [--file PATH] [--dry-run]
+            Take the top unclaimed ready item: mark it claimed in place and
+            emit a pre-filled [lane][claim] fenced block to post. Refuses if
+            the item's files are held live by another lane (S1 overlaps verb,
+            when present).
+  backlog   done BL-NNN [--pr NNNN] [--file PATH] [--dry-run]
+            Archive the item under ## done with the PR link.
 
 Enforcer verbs (cron-only; sweep/receipts-scan --post write to the board):
   Fail closed when the running scripts/room is not byte-identical to
@@ -894,6 +907,17 @@ render_md() { # $1=now_epoch $2=registry_json $3=watcher_state ; stdin: state JS
     | ($unclaimed | map("\(.lane) | \(.focus) | \(.trust)")) as $urows
     | ($rcpts | map("\(.task_id) | \(.merged) | \(.comment_id)")) as $rrows
     | (if .comments >= 1500 then "yes" else "no" end) as $rot
+    | ([$open_all[]
+        | .task_id as $t | .lane as $l | .state as $s
+        | .files[] | {file: ., lane: $l, task: $t, state: $s}]
+       | sort_by(.file, .task)) as $fmap
+    | ([$fmap[] | .file] | unique | length) as $nfiles
+    | ([$fmap[] | .file] | unique
+       | map(. as $f | {file: $f, holders: [$fmap[] | select(.file == $f)]})
+       | map(select(.holders | length > 1))) as $overlaps
+    | ($fmap | map("\(.file) | \(.lane // "(none)") | \(.task) | \(.state)")) as $frows
+    | ($overlaps
+       | map("\(.file) | \([.holders[].lane] | unique | sort | join(", ")) | \([.holders[].task] | unique | sort | join(", "))")) as $vrows
     | ["# ROOM-STATE — machine board",
       "<!-- generated: \(.generated_at) · board: \($board) · watermark: \(.watermark) · by: scripts/room rebuild · do-not-hand-edit -->",
       "",
@@ -902,6 +926,14 @@ render_md() { # $1=now_epoch $2=registry_json $3=watcher_state ; stdin: state JS
       ($orows | join("\n")),
       (if $orest > 0 then "… +\($orest) more" else empty end),
       (if ($orows | length) == 0 then "(none)" else empty end),
+      "",
+      "## file-claims",
+      "file | lane | task-id | state",
+      (if ($frows | length) == 0 then "(none)" else ($frows | join("\n")) end),
+      "",
+      "## overlap-warnings",
+      "file | lanes | task-ids",
+      (if ($vrows | length) == 0 then "(none)" else ($vrows | join("\n")) end),
       "",
       "## expiring-soon (<6h)",
       "task-id | lane | state | lease-expires-utc | files",
@@ -921,7 +953,7 @@ render_md() { # $1=now_epoch $2=registry_json $3=watcher_state ; stdin: state JS
       (if $frest > 0 then "… +\($frest) more" else empty end),
       "",
       "## signals",
-      "board_comments=\(.comments) threshold=1500 rotation_due=\($rot) watcher=\($watcher) open_claims=\($open_all | length) prose_open=\($popen | length) unfenced_prose=\(.unleased_prose_claims | length) watermark=\(.watermark)"]
+      "board_comments=\(.comments) threshold=1500 rotation_due=\($rot) watcher=\($watcher) open_claims=\($open_all | length) prose_open=\($popen | length) unfenced_prose=\(.unleased_prose_claims | length) files_claimed=\($nfiles) overlap_files=\($overlaps | length) watermark=\(.watermark)"]
     | join("\n") + "\n"
   '
 }
@@ -1264,6 +1296,55 @@ cmd_query() {
              and ($f == "" or (.files | contains($f)))))
     | if length == 0 then "(no matching rows)"
       else (.[] | "\(.task_id) | \(.lane) | \(.state) | \(.expires) | \(.files)") end'
+}
+
+# Live file/region claim registry (S1, software-factory brief 2026-09-26).
+# Read-only: reports which live claims hold which files, and where they
+# overlap. A lane runs this BEFORE drafting a claim to avoid the rebase
+# churn that file collisions cause. The `claim` verb hard-refuses on
+# collision; this verb is the soft pre-check.
+cmd_overlaps() {
+  local files="" state_path="" live=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --files) need_val "overlaps" "$1" "$#" "${2:-}"; files="$2"; shift 2 ;;
+    --state) need_val "overlaps" "$1" "$#" "${2:-}"; state_path="$2"; shift 2 ;;
+    --live)  live=1; shift ;;
+    *) die "overlaps: unknown flag $1" ;;
+  esac; done
+  local st
+  if [ -n "$state_path" ]; then
+    st="$(cat "$state_path")"
+  else
+    st="$(build_state)"
+  fi
+  [ -n "$files" ] && files="$(printf '%s' "$files" | tr ',' '\n' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' | paste -sd, -)"
+  printf '%s' "$st" | jq -r --arg fs "$files" '
+    def is_live($s): (["submitted","working","suspended"] | index($s)) != null;
+    ([.tasks[] | select(is_live(.state))]
+     | map({task_id, lane: (.lane // "(none)"), state, files})) as $open
+    | ([$open[] | .task_id as $t | .lane as $l | .state as $s
+        | .files[] | {file: ., lane: $l, task: $t, state: $s}]
+       | sort_by(.file, .task)) as $fmap
+    | (if $fs == "" then null
+       else ($fs | split(",") | map(select(length > 0))) end) as $want
+    | (if $want == null then
+         # No --files: report every file held by 2+ live claims.
+         ([$fmap[] | .file] | unique
+          | map(. as $f | {file: $f, holders: [$fmap[] | select(.file == $f)]})
+          | map(select(.holders | length > 1)))
+       else
+         # --files: report live holders for each requested file.
+         ($want | map(. as $f | {file: $f, holders: [$fmap[] | select(.file == $f)]}))
+       end) as $rows
+    | if ($rows | length) == 0 then
+        (if $want == null then "(no overlapping file claims)"
+         else "(no live claims hold the requested files)" end)
+      else
+        ($rows[]
+         | if (.holders | length) == 0 then "\(.file) | (unclaimed)"
+           else "\(.file) | \([.holders[].lane] | unique | sort | join(", ")) | \([.holders[].task] | unique | sort | join(", "))" end)
+      end'
 }
 
 # ---------------------------------------------------------------------------
@@ -1676,6 +1757,186 @@ cmd_metrics() {
   printf 'missing_receipts=%s\n' "$(printf '%s' "$st" | jq '[.tasks[] | select(.state == "completed" and (.receipts | length) == 0)] | length')"
   printf 'distinct_lanes=%s\n'   "$(printf '%s' "$st" | jq '.lanes | length')"
   printf 'comments_per_day=%s\n' "$cpd"
+  # S2 backlog depth (file-based; BACKLOG.md may not exist in older checkouts).
+  local blf
+  blf="$(repo_root)/BACKLOG.md"
+  if [ -f "$blf" ]; then
+    printf 'backlog_ready=%s\n'   "$(backlog_count "$blf" ready)"
+    printf 'backlog_blocked=%s\n' "$(backlog_count "$blf" blocked)"
+  else
+    printf 'backlog_ready=0\nbacklog_blocked=0\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# backlog — prioritized fed queue (S2). File-based: BACKLOG.md at repo root,
+# greppable, diffable, reorderable in one edit. John's single lever is the
+# file order under ## ready (top = next).
+# ---------------------------------------------------------------------------
+
+# backlog_count <file> <section> -> number of unchecked items in section
+backlog_count() {
+  awk -v sec="$2" '
+    /^## / { cur = ($2 == sec); next }
+    cur && /^- \[ \] BL-[0-9]+/ { n++ }
+    END { print n+0 }
+  ' "$1"
+}
+
+# backlog_top <file> -> "BL-ID|title|scope|accept|files" of first unchecked
+# ready item, or empty. Fields are " · "-separated; title is the first field.
+backlog_top() {
+  awk '
+    /^## ready/ { cur=1; next }
+    /^## / { cur=0; next }
+    cur && /^- \[ \] BL-[0-9]+/ {
+      line=$0
+      sub(/^- \[ \] /, "", line)
+      match(line, /BL-[0-9]+/); id=substr(line, RSTART, RLENGTH)
+      rest=line; sub(/^BL-[0-9]+ · /, "", rest)
+      # split rest on " · " — first piece is the title
+      n=split(rest, parts, / · /)
+      title=parts[1]
+      scope=""; accept=""; files=""
+      for (i=2; i<=n; i++) {
+        if (parts[i] ~ /^scope: /) { scope=parts[i]; sub(/^scope: /, "", scope) }
+        else if (parts[i] ~ /^accept: /) { accept=parts[i]; sub(/^accept: /, "", accept) }
+        else if (parts[i] ~ /^files: /) { files=parts[i]; sub(/^files: /, "", files) }
+      }
+      # skip already-claimed items (claimed: trailer present)
+      if (rest ~ / · claimed: /) next
+      print id "|" title "|" scope "|" accept "|" files
+      exit
+    }
+  ' "$1"
+}
+
+# backlog_list <file> — print ready items, top first.
+backlog_list() {
+  local file="$1"
+  awk '
+    /^## ready/ { cur=1; next }
+    /^## / { cur=0; next }
+    cur && /^- \[[ x]\] BL-[0-9]+/ { print }
+  ' "$file"
+}
+
+# backlog_next_task_id <file> -> RC-YYYY-MM-DD-NNN (next sequence for today)
+backlog_next_task_id() {
+  local file="$1" today seq
+  today="$(date -u +%Y-%m-%d)"
+  seq="$(grep -o "claimed: RC-${today}-[0-9]*" "$file" 2>/dev/null \
+    | grep -o '[0-9]*$' | sort -n | tail -1)"
+  seq="${seq:-0}"
+  printf 'RC-%s-%03d' "$today" "$((10#$seq + 1))"
+}
+
+cmd_backlog() {
+  local sub="list" file="" lane="$DEFAULT_LANE" task="" lease="6h" pr="" bl_id=""
+  case "${1:-}" in
+    list|pull|done) sub="$1"; shift ;;
+  esac
+  while [ $# -gt 0 ]; do case "$1" in
+    --file) need_val "backlog $sub" "$1" "$#" "${2:-}"; file="$2"; shift 2 ;;
+    --lane) need_val "backlog $sub" "$1" "$#" "${2:-}"; lane="$2"; shift 2 ;;
+    --task-id) need_val "backlog $sub" "$1" "$#" "${2:-}"; task="$2"; shift 2 ;;
+    --lease) need_val "backlog $sub" "$1" "$#" "${2:-}"; lease="$2"; shift 2 ;;
+    --pr) need_val "backlog $sub" "$1" "$#" "${2:-}"; pr="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *)
+      if [ "$sub" = "done" ] && [ -z "$bl_id" ]; then bl_id="$1"; shift
+      else die "backlog $sub: unknown argument $1"; fi ;;
+  esac; done
+  [ -n "$file" ] || file="$(repo_root)/BACKLOG.md"
+  [ -f "$file" ] || die "backlog: no BACKLOG.md at $file"
+  case "$lane" in ""|*[!A-Za-z0-9_-]*) die "backlog: --lane must match [A-Za-z0-9_-]+" ;; esac
+
+  case "$sub" in
+  list)
+    backlog_list "$file"
+    ;;
+  pull)
+    local top id title scope accept files
+    top="$(backlog_top "$file")"
+    [ -n "$top" ] || die "backlog pull: no unclaimed ready items"
+    id="${top%%|*}"; top="${top#*|}"
+    title="${top%%|*}"; top="${top#*|}"
+    scope="${top%%|*}"; top="${top#*|}"
+    accept="${top%%|*}"; files="${top##*|}"
+    [ -n "$task" ] || task="$(backlog_next_task_id "$file")"
+    case "$task" in
+      RC-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9]*) ;;
+      *) die "backlog pull: --task-id must match RC-YYYY-MM-DD-NNN" ;;
+    esac
+    [ -n "$files" ] || die "backlog pull: item $id has no files: field"
+    # S1 overlap guard: if the overlaps verb exists (S1 merged), refuse to
+    # pull an item whose files are held live by another lane. The overlaps
+    # verb reports per-file lines; "(unclaimed)" means free. Only die if
+    # some file has a real holder (a line not ending in "(unclaimed)").
+    if type cmd_overlaps >/dev/null 2>&1; then
+      local ov
+      ov="$(cmd_overlaps --files "$files" 2>/dev/null || true)"
+      if [ -n "$ov" ] && printf '%s' "$ov" | grep -v '(unclaimed)$' | grep -q .; then
+        die "backlog pull: files held by a live claim:\n$ov"
+      fi
+    fi
+    # Mark claimed in place (unless dry-run).
+    if [ "$DRY_RUN" != 1 ]; then
+      # Portable in-place: no GNU/BSD sed -i split.
+      local tmp
+      tmp="$(mktemp)"
+      sed "s/^- \\[ \\] \\(${id}\\)/&/" "$file" > "$tmp" # no-op guard
+      awk -v id="$id" -v task="$task" '
+        $0 ~ "^- \\[ \\] " id " · " {
+          if ($0 ~ / · claimed: /) sub(/ · claimed: [^ ·]*/, " · claimed: " task)
+          else sub(/$/, " · claimed: " task)
+        }
+        { print }
+      ' "$file" > "$tmp" && cat "$tmp" > "$file"
+      rm -f "$tmp"
+    fi
+    # Emit the pre-filled claim block for the lane to post.
+    local reason
+    reason="$scope"
+    [ -n "$accept" ] && reason="$reason (accept: $accept)"
+    reason="backlog $id: $reason"
+    printf '[%s][claim] %s\n\n' "$lane" "$title"
+    claim_block_text "$task" "$lane" "$files" "lease=${lease%h}h" "submitted" "$(one_line "$reason")"
+    printf '\n%s\n' "$(suffix_line "$task" "$lane")"
+    ;;
+  done)
+    [ -n "$bl_id" ] || die "backlog done: BL-NNN required"
+    case "$bl_id" in BL-[0-9]*) ;; *) die "backlog done: BL-NNN must match BL-<digits>" ;; esac
+    local line
+    line="$(grep -m1 "^- \\[[ x]\\] ${bl_id} · " "$file" || true)"
+    [ -n "$line" ] || die "backlog done: $bl_id not found"
+    # Remove from current section, append to ## done as checked.
+    if [ "$DRY_RUN" != 1 ]; then
+      local tmp newline
+      tmp="$(mktemp)"
+      newline="$(printf '%s' "$line" | sed 's/^- \[ \]/- [x]/')"
+      # drop any claimed: trailer, add shipped-as trailer
+      newline="$(printf '%s' "$newline" | sed 's/ · claimed: [^ ·]*//')"
+      [ -n "$pr" ] && newline="$newline · shipped as: #$pr"
+      grep -v "^- \\[[ x]\\] ${bl_id} · " "$file" > "$tmp"
+      # append under ## done (create section if missing)
+      if grep -q '^## done' "$tmp"; then
+        awk -v nl="$newline" '
+          /^## done/ { indone=1; print; next }
+          indone && /^## / { print nl; indone=0 }
+          { print }
+          END { if (indone) print nl }
+        ' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
+      else
+        printf '\n## done\n%s\n' "$newline" >> "$tmp"
+      fi
+      cat "$tmp" > "$file"
+      rm -f "$tmp"
+    fi
+    printf 'backlog done: %s archived\n' "$bl_id"
+    ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -1744,7 +2005,7 @@ main() {
       case "${1:-}" in --help|-h) usage; exit 0 ;; esac
       guard_enforcer_freshness "$verb"
       "cmd_${verb//-/_}" "$@" ;;
-    claim|heartbeat|release|query|handoff|receipt|_parse|_state|_clock|jev-shadow)
+    claim|heartbeat|release|query|overlaps|handoff|receipt|backlog|_parse|_state|_clock|jev-shadow)
       # Per-verb --help must not fall through to a live run (2026-09-19:
       # `sweep --help` executed a live sweep because cmd_sweep ignores args).
       case "${1:-}" in --help|-h) usage; exit 0 ;; esac
