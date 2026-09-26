@@ -67,17 +67,18 @@ function sh(cmd, args, input) {
 
 function fetchComments() {
   // Raw comment JSON array (id, created_at, body) — the exact input that
-  // scripts/room's parse_events consumes.
+  // scripts/room's parse_events consumes. --paginate emits one array per
+  // page, so merge them with jq -s first.
   const r = sh('gh', [
     'api',
     `repos/${REPO_SLUG}/issues/${BOARD_ISSUE}/comments`,
     '--paginate',
-    '-q',
-    '[.[] | {id, created_at, body}]',
   ]);
   if (!r.ok) return r;
+  const merged = sh('jq', ['-s', 'add | map({id, created_at, body})'], r.out);
+  if (!merged.ok) return { ok: false, err: 'comment merge: ' + merged.err };
   try {
-    return { ok: true, out: JSON.parse(r.out) };
+    return { ok: true, out: JSON.parse(merged.out) };
   } catch (e) {
     return { ok: false, err: 'comment JSON parse: ' + String(e).slice(0, 200) };
   }
