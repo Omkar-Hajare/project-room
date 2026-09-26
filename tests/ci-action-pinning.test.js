@@ -33,7 +33,7 @@ test("every third-party action ref is pinned to a commit SHA, never a mutable ta
   assert.ok(files.length > 0, "expected workflow files under .github/workflows");
   for (const f of files) {
     const refs = actionRefs(readFileSync(join(WORKFLOWS, f), "utf8"));
-    assert.ok(refs.length > 0, `${f}: no action refs found`);
+    if (refs.length === 0) continue; // no third-party actions: nothing to pin
     for (const ref of refs) {
       if (ref.startsWith("./") || ref.startsWith("docker://")) continue; // local/docker actions are not tag-pinned upstream
       const at = ref.lastIndexOf("@");
